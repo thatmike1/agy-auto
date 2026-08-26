@@ -1,0 +1,9 @@
+{
+  "_comment": "copy to agy-guard.local.json for patterns specific to this machine",
+  "deny": [
+    ["\\bterraform\\b[^|;&]*\\bdestroy\\b", "tears down infrastructure"]
+  ],
+  "ask": [
+    ["\\b(203\\.0\\.113\\.7|my-vps-host)\\b", "touches the production box"]
+  ]
+}

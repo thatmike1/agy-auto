@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+#
+# agy-image — generate an image with the Antigravity CLI's generate_image tool
+# and land it at a path you choose. Costs Google's quota, not Anthropic's.
+#
+#   agy-image --prompt "..." --out mock.png [--aspect 16:9] [--ref shot.png]...
+#   agy-image --prompt-file prompt.txt --out mock.png
+#
+# Fills the same role as impeccable's generate-image.mjs (which is OpenAI-only)
+# so design comps work on a harness with no native image tool. Writes the same
+# <out>.json prompt sidecar, and embeds the prompt into the file itself when
+# impeccable's embed-prompt.mjs is installed.
+#
+# The generate_image tool takes Prompt, ImageName, AspectRatio (1:1 2:3 3:2 3:4
+# 4:3 9:16 16:9) and ImagePaths (up to 3 references). It has no output-path
+# argument: agy writes where it likes and we harvest the result.
+
+set -euo pipefail
+
+AGY_HOME="${HOME}/.gemini/antigravity-cli"
+MODEL="gemini-3.7-flash-medium"
+TIMEOUT="8m"
+ASPECT=""
+OUT=""
+PROMPT=""
+REFS=()
+
+die() { echo "agy-image: $*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prompt)      PROMPT="$2"; shift 2 ;;
+    --prompt-file) PROMPT="$(cat "$2")"; shift 2 ;;
+    --out)         OUT="$2"; shift 2 ;;
+    --aspect)      ASPECT="$2"; shift 2 ;;
+    --ref)         REFS+=("$(realpath "$2")"); shift 2 ;;
+    --model)       MODEL="$2"; shift 2 ;;
+    --timeout)     TIMEOUT="$2"; shift 2 ;;
+    -h|--help)     sed -n '3,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *)             die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -n "$PROMPT" ]] || die "need --prompt or --prompt-file"
+[[ -n "$OUT" ]]    || die "need --out"
+command -v agy >/dev/null || die "agy is not on PATH"
+command -v jq  >/dev/null || die "jq is not on PATH"
+(( ${#REFS[@]} <= 3 )) || die "generate_image takes at most 3 reference images"
+
+if [[ -n "$ASPECT" && ! "$ASPECT" =~ ^(1:1|2:3|3:2|3:4|4:3|9:16|16:9)$ ]]; then
+  die "unsupported aspect '$ASPECT' (1:1 2:3 3:2 3:4 4:3 9:16 16:9)"
+fi
+
+for ref in "${REFS[@]}"; do
+  [[ -f "$ref" ]] || die "reference image not found: $ref"
+done
+
+mkdir -p "$(dirname "$OUT")"
+
+# ImageName wants lowercase underscores, three words at most; it shapes the
+# filename agy writes, which is how we recognize our own output.
+slug="$(basename "${OUT%.*}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_' | sed 's/^_//; s/_$//' | cut -c1-40)"
+[[ -n "$slug" ]] || slug="generated_image"
+run_id="$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')"
+image_name="${slug}_${run_id}"
+
+# "Do not run any shell commands" is load-bearing: headless agy cannot approve a
+# RunCommand it has no allowlist entry for, and the whole run dies CANCELED with
+# empty output. generate_image itself needs no permission grant.
+instruction="Use ONLY the generate_image tool. Do not run any shell commands at all.
+Pass ImageName exactly as: ${image_name}"
+[[ -n "$ASPECT" ]] && instruction+="
+Pass AspectRatio exactly as: ${ASPECT}"
+if (( ${#REFS[@]} )); then
+  instruction+="
+Pass these absolute paths in ImagePaths, and use them as input images:"
+  for ref in "${REFS[@]}"; do instruction+="
+${ref}"; done
+fi
+instruction+="
+
+${PROMPT}"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+marker="${work}/marker"; touch "$marker"
+
+add_dirs=()
+for ref in "${REFS[@]}"; do add_dirs+=(--add-dir "$(dirname "$ref")"); done
+
+# Two stdio traps, both from antigravity-for-claude-code's engine: agy drops its
+# output when stdin is not a TTY, and command substitution hangs forever when a
+# stdio MCP server inherits the pipe. Hence </dev/null and a temp file.
+set +e
+agy -p "$instruction" \
+    --model "$MODEL" \
+    --output-format json \
+    --print-timeout "$TIMEOUT" \
+    "${add_dirs[@]}" \
+    </dev/null >"${work}/out.json" 2>"${work}/err.txt"
+agy_status=$?
+set -e
+
+if (( agy_status != 0 )) || ! jq -e . "${work}/out.json" >/dev/null 2>&1; then
+  echo "agy-image: agy failed (exit ${agy_status})" >&2
+  cat "${work}/err.txt" >&2
+  exit 1
+fi
+
+status="$(jq -r '.status // "UNKNOWN"' "${work}/out.json")"
+cid="$(jq -r '.conversation_id // empty' "${work}/out.json")"
+if [[ "$status" != "SUCCESS" ]]; then
+  echo "agy-image: agy returned status ${status}" >&2
+  jq -r '.error // .response // empty' "${work}/out.json" >&2
+  cat "${work}/err.txt" >&2
+  exit 1
+fi
+
+# Preferred: the conversation's own brain directory. Fallback: anything newer
+# than the marker anywhere under the agy home, because the write location has
+# been observed to move between agy versions.
+find_image() {
+  local root="$1"
+  [[ -d "$root" ]] || return 0
+  find "$root" -type f -newer "$marker" \
+       \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.svg' \) \
+       -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-
+}
+
+src=""
+[[ -n "$cid" ]] && src="$(find_image "${AGY_HOME}/brain/${cid}")"
+[[ -n "$src" ]] || src="$(find_image "$AGY_HOME")"
+
+if [[ -z "$src" ]]; then
+  echo "agy-image: agy reported success but produced no image file" >&2
+  jq -r '.response // empty' "${work}/out.json" >&2
+  exit 1
+fi
+
+# agy always writes JPEG today; keep the real format in the extension rather
+# than lying with the requested one.
+src_ext="${src##*.}"
+out_ext="${OUT##*.}"
+if [[ "${src_ext,,}" != "${out_ext,,}" ]]; then
+  case "${src_ext,,}" in
+    jpg|jpeg) [[ "${out_ext,,}" == "jpg" || "${out_ext,,}" == "jpeg" ]] || OUT="${OUT%.*}.${src_ext,,}" ;;
+    *)        OUT="${OUT%.*}.${src_ext,,}" ;;
+  esac
+fi
+
+cp "$src" "$OUT"
+
+jq -n --arg prompt "$PROMPT" \
+      --arg createdAt "$(date -Iseconds)" \
+      --arg model "$MODEL" \
+      --arg aspect "$ASPECT" \
+      --argjson refs "$(printf '%s\n' "${REFS[@]+"${REFS[@]}"}" | jq -R . | jq -sc 'map(select(length > 0))')" \
+      '{prompt: $prompt, createdAt: $createdAt, tool: "agy-image", model: "antigravity generate_image (driver: \($model))"}
+       + (if $aspect == "" then {} else {aspect: $aspect} end)
+       + (if ($refs | length) == 0 then {} else {refs: $refs} end)' > "${OUT}.json"
+
+# Impeccable reads the prompt back off the asset itself; embed it when its
+# helper is installed, newest plugin version first.
+embed="$(ls -d "${HOME}"/.claude/plugins/cache/impeccable/impeccable/*/skills/impeccable/scripts/embed-prompt.mjs 2>/dev/null | sort -V | tail -1)"
+if [[ -n "$embed" ]] && command -v node >/dev/null; then
+  node "$embed" "$OUT" --prompt "$PROMPT" >/dev/null 2>&1 || true
+fi
+
+size="$(stat -c%s "$OUT")"
+(( size > 1024 )) || die "output is only ${size} bytes, generation probably failed: $OUT"
+
+echo "IMAGE: ${OUT} ($(file -b --mime-type "$OUT"), ${size} bytes, antigravity generate_image${ASPECT:+, $ASPECT}, billed to your Google quota); prompt sidecar at ${OUT}.json"

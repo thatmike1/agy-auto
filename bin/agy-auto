@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# agy-auto — agy with no permission prompts, gated by the agy-guard hook.
+#
+#   agy-auto                      # interactive, no prompts
+#   agy-auto -p='summarise x.log' # headless
+#
+# agy has no equivalent of Claude Code's auto mode: its PreToolUse hook can
+# block a command but cannot silently approve one, so a normal session prompts
+# no matter what the hook returns. The only way to stop the prompting is
+# --dangerously-skip-permissions, and a hook "deny" is still enforced under it.
+#
+# So this wrapper pairs the flag with the guard, and sets AGY_GUARD_STRICT so
+# the guard's ask list (sudo, git push, recursive rm, package removal, ...)
+# blocks instead of silently passing — under the flag an "ask" would just run.
+#
+# Every verdict lands in ~/.gemini/config/agy-guard.log. Run plain `agy` when
+# you want to approve one of those by hand.
+
+set -euo pipefail
+
+GUARD="${HOME}/.gemini/config/agy-guard.py"
+HOOKS="${HOME}/.gemini/config/hooks.json"
+
+for f in "$GUARD" "$HOOKS"; do
+  if [[ ! -f "$f" ]]; then
+    echo "agy-auto: missing $f — refusing to skip permissions without the guard" >&2
+    exit 1
+  fi
+done
+
+# fail closed: if the guard cannot deny, do not run unguarded
+if ! printf '%s' '{"toolCall":{"name":"run_command","args":{"CommandLine":"echo GUARD_CANARY"}}}' \
+    | python3 "$GUARD" | grep -q '"decision": "deny"'; then
+  echo "agy-auto: guard did not deny its own canary — refusing to skip permissions" >&2
+  exit 1
+fi
+
+export AGY_GUARD_STRICT=1
+exec agy --dangerously-skip-permissions "$@"
