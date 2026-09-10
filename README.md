@@ -69,7 +69,7 @@ cd agy-auto
 
 That puts `agy-auto` on your `PATH`, installs the hook into `~/.gemini/config/`, and registers it
 in `hooks.json`. It refuses to overwrite an existing `hooks.json` and prints the block to merge
-by hand instead. `--with-claude` also installs the `grunt` subagent.
+by hand instead. It also puts `grunt` and `agy-image` on your `PATH`.
 
 Verify:
 
@@ -96,15 +96,22 @@ startup and keeps the shared guard clean:
 
 See `guard/agy-guard.local.example.json`.
 
-## The Claude Code side
+## Handing work to Gemini
 
-`agy` is useful from Claude Code because it spends Google's quota instead of Anthropic's. Two
-pieces here do that:
+`agy` is useful from a Claude Code session because it spends Google's quota instead of
+Anthropic's. Two commands here do that:
 
-- **`claude/agents/grunt.md`** — a subagent that forwards one bulk job to agy and relays the
-  answer. Big-and-shallow work (piles of logs, repo-wide sweeps, mechanical edits) grinds outside
-  Claude's context. It calls `agy-auto`, because headless agy cannot prompt and dies silently on
-  any command outside the allowlist.
+- **`bin/grunt`** — hand one bulk job to Gemini and print the answer. Big-and-shallow work (piles
+  of logs, repo-wide sweeps, mechanical edits) grinds inside Gemini's context, and only the
+  summary comes back. `-w N` tells Gemini to split the job across N of its own subagents via
+  `invoke_subagent` and answer from what they report, so the N intermediate results never cross
+  back either. Every run is written to `~/.cache/grunt/`, and the conversation id it prints can be
+  followed live.
+
+  This used to be a Claude Code subagent whose instructions said to shell out to `agy`. It was
+  removed in favour of the script, because a model in that position can decide to do the job
+  itself instead — and did, silently, on Anthropic's quota. A shell script cannot make that
+  choice, and the conversation id proves which engine ran.
 - **`bin/agy-image`** — image generation through agy's `generate_image` tool, landing the result
   at a path you choose. Useful on a harness with no native image tool.
 

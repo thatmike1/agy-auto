@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+#
+# grunt — hand one job to Gemini through the Antigravity CLI and print what it says.
+#
+#   grunt 'summarise every .log in ./logs'
+#   grunt -d ~/git/foo -d ~/git/bar 'find every TODO across both repos'
+#   grunt -w 4 'review each file under src/ and list the dead exports'
+#   grunt -f ./job.md
+#
+# The point is that the grinding happens in Gemini's context on Google's quota,
+# and only the answer comes back here. There is deliberately no model in the
+# middle deciding whether to forward the job: this is a shell script, so either
+# it ran agy or it did not, and the conversation id below proves which.
+#
+# Every run is written to ~/.cache/grunt/ and can be followed live with peek.
+
+set -euo pipefail
+
+MODEL='gemini-3.8-flash-medium'
+TIMEOUT='30m'
+WORKERS=0
+QUIET=0
+RAW=0
+RESUME=''
+PROMPT=''
+DIRS=()
+
+usage() { sed -n '3,16p' "$0" | sed 's/^# \?//'; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--add-dir) DIRS+=("$2"); shift 2 ;;
+    -m|--model)   MODEL="$2"; shift 2 ;;
+    -t|--timeout) TIMEOUT="$2"; shift 2 ;;
+    -r|--resume)  RESUME="$2"; shift 2 ;;
+    -w|--workers) WORKERS="$2"; shift 2 ;;
+    -f|--file)    PROMPT="$(cat "$2")"; shift 2 ;;
+    -q|--quiet)   QUIET=1; shift ;;
+    -j|--json)    RAW=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    -*)           echo "grunt: unknown option: $1" >&2; exit 2 ;;
+    *)            PROMPT="$1"; shift ;;
+  esac
+done
+
+[[ -n "$PROMPT" ]] || { usage >&2; exit 2; }
+command -v agy-auto >/dev/null || { echo 'grunt: agy-auto is not on PATH' >&2; exit 1; }
+
+# headless agy ignores the shell's working directory and runs in its own scratch
+# dir, so without --add-dir the job sees no files and no workspace AGENTS.md
+[[ ${#DIRS[@]} -gt 0 ]] || DIRS=("$PWD")
+
+# fan-out is a prompt instruction, not a flag: agy exposes invoke_subagent to the
+# model, and letting Gemini spawn and collect its own workers keeps every
+# intermediate result inside its context instead of returning N blobs to read
+if [[ "$WORKERS" -gt 1 ]]; then
+  PROMPT="Split this job across ${WORKERS} subagents. Call invoke_subagent ONCE with all ${WORKERS} of them in the Subagents list, each with TypeName 'self', Model 'flash', a distinct Role, and a Prompt covering its own slice with no overlap. Tell each one not to ask for input. Then wait for all of them, and answer the job yourself from what they report — do not do their slices yourself and do not paste their reports back verbatim.
+
+THE JOB:
+${PROMPT}"
+fi
+
+RUNS="${HOME}/.cache/grunt"
+mkdir -p "$RUNS"
+OUT="${RUNS}/$(date +%Y%m%d-%H%M%S).json"
+
+ARGS=(-p "$PROMPT" --model "$MODEL" --output-format json --print-timeout "$TIMEOUT")
+for d in "${DIRS[@]}"; do ARGS+=(--add-dir "$d"); done
+[[ -n "$RESUME" ]] && ARGS+=(--conversation "$RESUME")
+
+set +e
+agy-auto "${ARGS[@]}" >"$OUT" 2>"${OUT%.json}.err"
+STATUS=$?
+set -e
+
+if [[ ! -s "$OUT" ]]; then
+  echo "grunt: agy produced no output (exit ${STATUS})" >&2
+  [[ -s "${OUT%.json}.err" ]] && cat "${OUT%.json}.err" >&2
+  exit "${STATUS:-1}"
+fi
+
+if [[ "$RAW" == 1 ]]; then cat "$OUT"; exit "$STATUS"; fi
+
+QUIET="$QUIET" OUT="$OUT" python3 - <<'REPORT'
+import json, os
+
+path = os.environ['OUT']
+with open(path) as f:
+    env = json.load(f)
+
+usage = env.get('usage') or {}
+secs = env.get('duration_seconds')
+took = f"{secs:.0f}s" if isinstance(secs, (int, float)) else '?'
+tokens = f"{usage.get('output_tokens', '?')} out / {usage.get('input_tokens', '?')} in"
+cid = env.get('conversation_id')
+
+print(f"conversation: {cid}")
+print(f"status: {env.get('status')}  ·  {took}  ·  {tokens}")
+print(f"peek: node ~/.claude/skills/peek/scripts/peek.mjs {cid}")
+print(f"log: {path}")
+
+if os.environ.get('QUIET') != '1':
+    print()
+    print(env.get('response') or '(no response)')
+REPORT
+
+exit "$STATUS"

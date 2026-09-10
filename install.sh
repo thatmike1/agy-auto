@@ -2,8 +2,7 @@
 #
 # install.sh — put agy-auto on PATH and register the guard hook with agy.
 #
-#   ./install.sh                 # guard + agy-auto + agy-image
-#   ./install.sh --with-claude   # also install the grunt subagent for Claude Code
+#   ./install.sh                 # guard + agy-auto + agy-image + grunt
 #
 # Nothing here overwrites a file you already edited: an existing hooks.json or
 # agy-guard.py is left alone and the difference is reported instead.
@@ -13,13 +12,10 @@ set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${HOME}/.gemini/config"
 BIN="${HOME}/.local/bin"
-AGENTS="${HOME}/.claude/agents"
-WITH_CLAUDE=0
 
 for arg in "$@"; do
   case "$arg" in
-    --with-claude) WITH_CLAUDE=1 ;;
-    -h|--help) sed -n '3,10p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help) sed -n '3,9p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "install.sh: unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
@@ -62,12 +58,7 @@ fi
 
 install -m 0755 "$SRC/bin/agy-auto" "$BIN/agy-auto"
 install -m 0755 "$SRC/bin/agy-image" "$BIN/agy-image"
-
-if [[ "$WITH_CLAUDE" == 1 ]]; then
-  mkdir -p "$AGENTS"
-  install -m 0644 "$SRC/claude/agents/grunt.md" "$AGENTS/grunt.md"
-  echo "install.sh: installed the grunt subagent to $AGENTS"
-fi
+install -m 0755 "$SRC/bin/grunt" "$BIN/grunt"
 
 echo
 python3 "$CONFIG/agy-guard.py" --self-test
