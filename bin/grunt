@@ -13,6 +13,10 @@
 # it ran agy or it did not, and the conversation id below proves which.
 #
 # Every run is written to ~/.cache/grunt/ and can be followed live with peek.
+#
+# Peek the run at about 15 minutes. Every long job so far had its code written
+# and its tests green by then and burned the rest re-verifying until the 30m
+# timeout; if that is where it is, kill the agy process and commit it yourself.
 
 set -euo pipefail
 
@@ -62,6 +66,7 @@ fi
 
 RUNS="${HOME}/.cache/grunt"
 mkdir -p "$RUNS"
+STARTED="$(date -Iseconds)"
 OUT="${RUNS}/$(date +%Y%m%d-%H%M%S).json"
 
 ARGS=(-p "$PROMPT" --model "$MODEL" --output-format json --print-timeout "$TIMEOUT")
@@ -78,6 +83,29 @@ if [[ ! -s "$OUT" ]]; then
   [[ -s "${OUT%.json}.err" ]] && cat "${OUT%.json}.err" >&2
   exit "${STATUS:-1}"
 fi
+
+# one line per run in ledger.jsonl, so how much a model's quota held can be
+# reconstructed later: tokens per run, and the quota error with its reset time
+MODEL="$MODEL" OUT="$OUT" STARTED="$STARTED" python3 - <<'LEDGER' || true
+import json, os
+out = os.environ['OUT']
+try:
+    env = json.load(open(out))
+except Exception:
+    env = {}
+line = {
+    'started': os.environ['STARTED'],
+    'model': os.environ['MODEL'],
+    'conversation_id': env.get('conversation_id'),
+    'status': env.get('status'),
+    'error': env.get('error'),
+    'duration_seconds': env.get('duration_seconds'),
+    'usage': env.get('usage'),
+    'log': out,
+}
+with open(os.path.join(os.path.dirname(out), 'ledger.jsonl'), 'a') as f:
+    f.write(json.dumps(line) + '\n')
+LEDGER
 
 if [[ "$RAW" == 1 ]]; then cat "$OUT"; exit "$STATUS"; fi
 
